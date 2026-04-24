@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Import Apple certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "build" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "build" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: -s -k "build" "$KEYCHAIN_PATH"
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild clean archive \
+            -project Claw-Mem.xcodeproj \
+            -scheme Claw-Mem \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/Claw-Mem.xcarchive"
+
+      - name: Export (Developer ID)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>developer-id</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Claw-Mem.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Notarize & staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          APP_PATH="$RUNNER_TEMP/export/Claw-Mem.app"
+          NOTARIZE_ZIP="$RUNNER_TEMP/Claw-Mem-notarize.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$NOTARIZE_ZIP"
+          xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP_PATH"
+
+      - name: Create distribution zip
+        id: zip
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP_NAME="Claw-Mem-${VERSION}.zip"
+          ZIP_PATH="$RUNNER_TEMP/${ZIP_NAME}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/export/Claw-Mem.app" \
+            "$ZIP_PATH"
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
+
+      - name: Install Sparkle tools
+        run: |
+          SPARKLE_VERSION="2.9.1"
+          curl -L \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/sparkle.tar.xz"
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+
+      - name: Sign update with Sparkle
+        id: sparkle
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          ZIP_PATH="${{ steps.zip.outputs.zip_path }}"
+          SIGN_OUTPUT=$("$RUNNER_TEMP/sparkle/bin/sign_update" "$ZIP_PATH")
+          ED_SIG=$(echo "$SIGN_OUTPUT" | grep -oE 'sparkle:edSignature="[^"]+"' | cut -d'"' -f2)
+          FILE_SIZE=$(echo "$SIGN_OUTPUT" | grep -oE 'length="[0-9]+"' | cut -d'"' -f2)
+          echo "ed_signature=$ED_SIG" >> $GITHUB_OUTPUT
+          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: ${{ steps.zip.outputs.zip_path }}
+
+      - name: Update appcast.xml
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          DATE=$(date -u "+%a, %d %b %Y %H:%M:%S +0000")
+          ED_SIG="${{ steps.sparkle.outputs.ed_signature }}"
+          FILE_SIZE="${{ steps.sparkle.outputs.file_size }}"
+          ZIP_NAME="${{ steps.zip.outputs.zip_name }}"
+          DOWNLOAD_URL="https://github.com/JakeChang/claw-mem/releases/download/${TAG}/${ZIP_NAME}"
+
+          python3 - << PYTHON
+import os
+
+version     = os.environ['VERSION']
+date        = os.environ['DATE']
+ed_sig      = os.environ['ED_SIG']
+file_size   = os.environ['FILE_SIZE']
+download_url = os.environ['DOWNLOAD_URL']
+
+new_item = f"""  <item>
+    <title>Version {version}</title>
+    <pubDate>{date}</pubDate>
+    <sparkle:version>{version}</sparkle:version>
+    <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
+    <enclosure
+      url="{download_url}"
+      sparkle:edSignature="{ed_sig}"
+      length="{file_size}"
+      type="application/octet-stream"
+    />
+  </item>
+"""
+
+with open('appcast.xml', 'r', encoding='utf-8') as f:
+    content = f.read()
+
+content = content.replace('  </channel>', new_item + '  </channel>', 1)
+
+with open('appcast.xml', 'w', encoding='utf-8') as f:
+    f.write(content)
+
+print("appcast.xml updated")
+PYTHON
+
+      - name: Commit & push appcast.xml
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add appcast.xml
+          git commit -m "chore: update appcast for v${{ steps.version.outputs.version }}"
+          git push origin HEAD:main
