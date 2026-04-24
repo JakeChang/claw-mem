@@ -23,6 +23,7 @@ private struct MenuBarRoot: View {
 
 // MARK: - App Delegate
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
